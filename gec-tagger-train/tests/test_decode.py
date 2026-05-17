@@ -1,4 +1,4 @@
-from gec_tagger_train.decode import apply_tags_once
+from gec_tagger_train.decode import apply_tags_iterative, apply_tags_once
 
 
 def test_keep_returns_input_unchanged() -> None:
@@ -44,3 +44,40 @@ def test_transform_case_capital() -> None:
 def test_transform_verb_falls_through_as_keep() -> None:
     out = apply_tags_once(["go"], ["$TRANSFORM_VERB_VB_VBZ"])
     assert out == ["go"]
+
+
+def test_iterative_stops_on_noop_pass() -> None:
+    calls = []
+
+    def tagger(toks: list[str]) -> list[str]:
+        calls.append(list(toks))
+        return ["$KEEP"] * len(toks)
+
+    out = apply_tags_iterative(["he", "is", "ok"], tagger, max_iter=3)
+    assert out == ["he", "is", "ok"]
+    assert len(calls) == 1
+
+
+def test_iterative_chains_two_passes() -> None:
+    sequence = iter([
+        ["$KEEP", "$REPLACE_goes", "$KEEP"],     # pass 1: he go home -> he goes home
+        ["$TRANSFORM_CASE_CAPITAL", "$KEEP", "$KEEP"],  # pass 2: capitalize first
+        ["$KEEP", "$KEEP", "$KEEP"],             # pass 3: no-op, stop
+    ])
+
+    def tagger(_toks: list[str]) -> list[str]:
+        return next(sequence)
+
+    out = apply_tags_iterative(["he", "go", "home"], tagger, max_iter=5)
+    assert out == ["He", "goes", "home"]
+
+
+def test_iterative_respects_max_iter() -> None:
+    def tagger(toks: list[str]) -> list[str]:
+        # Always proposes one replacement; iterative would loop forever.
+        if toks and toks[0] != "DONE":
+            return ["$REPLACE_DONE"] + ["$KEEP"] * (len(toks) - 1)
+        return ["$KEEP"] * len(toks)
+
+    out = apply_tags_iterative(["a", "b"], tagger, max_iter=2)
+    assert out == ["DONE", "b"]

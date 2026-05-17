@@ -92,25 +92,87 @@ pub fn decode_tag_string(s: &str) -> (String, String) {
 
 #[cfg(feature = "ort-runtime")]
 pub mod ort_runtime {
-    use super::{EncoderSession, Result};
-    use ndarray::Array2;
     use std::path::Path;
+    use std::sync::Mutex;
 
+    use anyhow::Context;
+    use ndarray::{Array, Array2};
+    use ort::session::Session;
+    use ort::value::Value;
+
+    use super::{EncoderSession, Result};
+
+    /// ort-backed ONNX encoder. The session is wrapped in a Mutex so the
+    /// `EncoderSession` trait (which takes `&self`) can mutate the session
+    /// during `run`. ort 2.0 `Session::run` requires `&mut self`.
     pub struct OrtEncoder {
-        _path: std::path::PathBuf,
+        session: Mutex<Session>,
     }
 
     impl OrtEncoder {
         pub fn from_file(path: &Path) -> Result<Self> {
+            let session = Session::builder()
+                .context("ort Session::builder")?
+                .commit_from_file(path)
+                .with_context(|| format!("ort commit_from_file({})", path.display()))?;
             Ok(Self {
-                _path: path.to_path_buf(),
+                session: Mutex::new(session),
             })
         }
     }
 
     impl EncoderSession for OrtEncoder {
-        fn forward(&self, _input_ids: &[i64], _attention_mask: &[i64]) -> Result<Array2<f32>> {
-            anyhow::bail!("ort-runtime not wired yet — see gec-engine/FOLLOWUPS.md")
+        fn forward(&self, input_ids: &[i64], attention_mask: &[i64]) -> Result<Array2<f32>> {
+            let seq_len = input_ids.len();
+            anyhow::ensure!(
+                seq_len == attention_mask.len(),
+                "input_ids and attention_mask must agree in length"
+            );
+
+            let ids = Array::from_shape_vec((1, seq_len), input_ids.to_vec())
+                .context("input_ids shape")?;
+            let mask = Array::from_shape_vec((1, seq_len), attention_mask.to_vec())
+                .context("attention_mask shape")?;
+
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ort session mutex poisoned"))?;
+
+            let outputs = session
+                .run(ort::inputs![
+                    "input_ids" => Value::from_array(ids)?,
+                    "attention_mask" => Value::from_array(mask)?,
+                ])
+                .context("ort session.run")?;
+
+            // Expected output name is "logits". ort rc.10 returns &Value here.
+            let logits_value = outputs
+                .get("logits")
+                .ok_or_else(|| anyhow::anyhow!("ort session has no `logits` output"))?;
+
+            let (shape, data) = logits_value
+                .try_extract_tensor::<f32>()
+                .context("extract logits as f32")?;
+
+            // ort 2.0 Shape is iterable into i64. Accept [1, seq, num_tags]
+            // or [seq, num_tags] by collecting + matching.
+            let dims: Vec<i64> = shape.iter().copied().collect();
+            let (seq, num_tags) = match dims.as_slice() {
+                [1, s, t] => (*s as usize, *t as usize),
+                [s, t] => (*s as usize, *t as usize),
+                other => anyhow::bail!("unexpected logits shape: {:?}", other),
+            };
+            anyhow::ensure!(
+                seq == seq_len,
+                "ort returned seq_len={} but expected {}",
+                seq,
+                seq_len
+            );
+
+            let arr = Array2::from_shape_vec((seq, num_tags), data.to_vec())
+                .context("Array2 from logits buffer")?;
+            Ok(arr)
         }
     }
 }

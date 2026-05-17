@@ -27,9 +27,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
-ort = { version = "2.0.0-rc.4", default-features = false, features = ["ndarray"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["ndarray", "load-dynamic"] }
 ndarray = "0.16"
-llama-cpp-2 = "0.1"
+llama-cpp-2 = "0.1.117"
 proptest = "1.5"
 
 [profile.release]

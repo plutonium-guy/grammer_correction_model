@@ -10,7 +10,8 @@ publish.workspace = true
 gec-core = { path = "../gec-core" }
 anyhow = { workspace = true }
 llama-cpp-2 = { workspace = true, optional = true }
+encoding_rs = { version = "0.8", optional = true }
 
 [features]
 default = []
-llama-runtime = ["dep:llama-cpp-2"]
+llama-runtime = ["dep:llama-cpp-2", "dep:encoding_rs"]
