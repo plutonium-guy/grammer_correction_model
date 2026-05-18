@@ -117,9 +117,15 @@ def eval_cmd(
     tags: Path = typer.Option(..., exists=True),
     dev: Path = typer.Option(..., exists=True, help="JSONL with {src, ref} per row"),
     max_length: int = typer.Option(128),
+    max_iter: int = typer.Option(
+        3,
+        min=1,
+        max=10,
+        help="Iterative decoding passes. GECToR convention is 3.",
+    ),
 ) -> None:
     """Run a tagger checkpoint on a dev JSONL and print ERRANT F0.5."""
-    from gec_tagger_train.decode import apply_tags_once
+    from gec_tagger_train.decode import apply_tags_iterative
     from gec_tagger_train.eval_errant import compute_errant_f05
     from gec_tagger_train.model import DebertaTagger
 
@@ -132,43 +138,47 @@ def eval_cmd(
     model.load_state_dict(state, strict=False)
     model.eval()
 
-    srcs: list[str] = []
-    refs: list[str] = []
-    hyps: list[str] = []
-    with torch.no_grad():
-        for src, ref in _iter_dev_pairs(dev):
-            words = src.split()
-            if not words:
-                continue
-            enc = tok(
-                words,
-                is_split_into_words=True,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length,
-            )
+    def tag_words(words: list[str]) -> list[str]:
+        if not words:
+            return []
+        enc = tok(
+            words,
+            is_split_into_words=True,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+        )
+        with torch.no_grad():
             logits = model(
                 input_ids=enc["input_ids"], attention_mask=enc["attention_mask"]
             )["logits"]
-            preds = logits.argmax(dim=-1)[0].tolist()
-            word_ids = enc.word_ids(0)
-            # First-subword strategy: keep prediction for the first subword of each word.
-            seen: set[int] = set()
-            word_tag_ids: list[int] = [vocab.id_of("$KEEP")] * len(words)
-            for pos, w in enumerate(word_ids):
-                if w is None or w in seen:
-                    continue
-                seen.add(w)
-                if w < len(word_tag_ids):
-                    word_tag_ids[w] = preds[pos]
-            word_tags = [
-                vocab.tags[i] if 0 <= i < len(vocab.tags) else "$KEEP"
-                for i in word_tag_ids
-            ]
-            hyp_words = apply_tags_once(words, word_tags)
-            srcs.append(src)
-            refs.append(ref)
-            hyps.append(" ".join(hyp_words))
+        preds = logits.argmax(dim=-1)[0].tolist()
+        word_ids = enc.word_ids(0)
+        # First-subword strategy.
+        seen: set[int] = set()
+        word_tag_ids: list[int] = [vocab.id_of("$KEEP")] * len(words)
+        for pos, w in enumerate(word_ids):
+            if w is None or w in seen:
+                continue
+            seen.add(w)
+            if w < len(word_tag_ids):
+                word_tag_ids[w] = preds[pos]
+        return [
+            vocab.tags[i] if 0 <= i < len(vocab.tags) else "$KEEP"
+            for i in word_tag_ids
+        ]
+
+    srcs: list[str] = []
+    refs: list[str] = []
+    hyps: list[str] = []
+    for src, ref in _iter_dev_pairs(dev):
+        words = src.split()
+        if not words:
+            continue
+        hyp_words = apply_tags_iterative(words, tag_words, max_iter=max_iter)
+        srcs.append(src)
+        refs.append(ref)
+        hyps.append(" ".join(hyp_words))
 
     score = compute_errant_f05(src=srcs, ref=refs, hyp=hyps)
     typer.echo(json.dumps(score))

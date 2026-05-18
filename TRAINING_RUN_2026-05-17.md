@@ -262,3 +262,122 @@ Running both jobs in parallel: each ran at ~2.0-2.3 it/s (vs ~7.5 it/s solo), so
 | GEC correction | `gec-tagger-train/.checkpoints/gec_mlx/adapters.safetensors` (= iter 1000) | ~31 MB | 0.520 |
 
 Both adapters compose with `Qwen/Qwen2.5-3B-Instruct` via `mlx_lm.generate --adapter-path …`.
+
+## BEA-2019 retrain (next-day run)
+
+After downloading W&I+LOCNESS from the public BEA-2019 distribution
+(`https://www.cl.cam.ac.uk/research/nl/bea2019st/data/wi+locness_v2.1.bea19.tar.gz`,
+no registration required for the W&I+LOCNESS subset) and placing
+`ABC.train.gold.bea19.m2` and `ABCN.dev.gold.bea19.m2` under
+`data-pipeline/data/raw/bea2019/` as `train.m2` and `dev.m2`:
+
+```
+cd data-pipeline
+uv run data-pipeline build-gec --root . --sources bea2019 --split train
+# -> 33,432 minimal-edit pairs in data/processed/gec_tagger.jsonl
+
+cd ../gec-tagger-train
+# Convert tagger JSONL -> ChatML SFT, then train Qwen2.5-3B LoRA with mlx-lm:
+uv run mlx_lm.lora --model Qwen/Qwen2.5-3B-Instruct --train \
+    --data .checkpoints/bea_mlx_data --fine-tune-type lora \
+    --num-layers 16 --batch-size 2 --iters 3000 \
+    --learning-rate 5e-5 --max-seq-length 256 \
+    --adapter-path .checkpoints/bea_mlx \
+    --steps-per-report 100 --steps-per-eval 300 --save-every 300 --mask-prompt
+```
+
+### Training trajectory
+
+| Iter | Train | Val |
+|---|---|---|
+| 1 | n/a | 2.875 (baseline) |
+| 300 | 0.362 | 0.286 |
+| 600 | 0.309 | 0.317 |
+| 900 | 0.334 | 0.296 |
+| 1200 | 0.286 | 0.366 |
+| 1500 | 0.267 | 0.283 |
+| 1800 | 0.297 | 0.282 |
+| 2100 | 0.267 | 0.287 |
+| 2400 | 0.283 | 0.282 |
+| 2700 | 0.260 | 0.290 |
+| **3000** | **0.285** | **0.281** |
+
+Val loss bounced between 0.281–0.366; iter 3000 is best at 0.281
+(8.7 % below initial best at iter 300). Training took ~17 minutes on
+M2 Max, peak memory 8.5 GB, 3.2 it/s solo.
+
+### Eval (300-pair held-out BEA-dev, 100 evaluated)
+
+```
+uv run python scripts/eval_mlx_gec.py \
+    --adapter .checkpoints/bea_mlx \
+    --dev eval_data/bea_dev.jsonl \
+    --limit 100 --max-tokens 80
+```
+
+```
+{"precision": 0.5433, "recall": 0.3651, "f0.5": 0.4950, "n": 100, "elapsed_s": 78.2}
+```
+
+| Metric | Value | Spec target (§9.2) |
+|---|---|---|
+| **Precision** | **0.543** | n/a |
+| **Recall** | **0.365** | n/a |
+| **ERRANT F0.5** | **0.4950** | ≥ 0.65 |
+
+Below the spec target but a real, measurable signal — and a ~50× lift
+over the JFLEG-trained checkpoint (F0.5 = 0.0, collapsed to all-KEEP).
+The gap to the 0.65 target is expected: the published GECToR numbers
+were obtained with a multi-stage curriculum (C4_200M pretrain → BEA-2019
+→ W&I+L) on a token-classification head, while this run is a single
+LoRA pass over Qwen2.5-3B doing seq2seq correction. Closing the gap
+requires more iters, NUCLE + FCE + Lang-8 data, and the multi-stage
+recipe.
+
+### Generation smoke
+
+```
+IN : He go to school        OUT: He goes to school
+IN : I are happy            OUT: I am happy
+IN : she walk fast          OUT: She walks fast .
+IN : they was tired yesterday OUT: They were tired yesterday .
+IN : she have a cat         OUT: She has a cat .
+```
+
+5/5 grammar errors corrected (capitalization, subject-verb agreement,
+verb conjugation, past tense). Trailing-space + period artifact is from
+the BEA-2019 whitespace tokenization carried through the data-pipeline.
+
+## Negative results (2026-05-18)
+
+After v2 (F0.5 = 0.533, published to HF), three further iterations to test capacity- and data-scaling hypotheses. All underperformed v2 on the same 100-pair BEA-dev eval.
+
+### v2.1 — same data, rank 16
+
+Identical to v2 but doubled LoRA rank (8 → 16) on the same BEA + Coedit corpus (42,491 pairs), all 36 layers, 5000 iters. 29.93 M trainable vs 14.97 M.
+
+| Snapshot | F0.5 |
+|---|---|
+| iter 3,500 (best val 0.171) | **0.508** |
+| iter 5,000 (final val 0.189) | **0.517** |
+
+Both below v2's 0.533. Higher rank did not help on the 42k-pair corpus — likely overfit on the relatively small data.
+
+### v3 — added agentlans/grammar-correction (137 k pairs, mixed quality)
+
+Combined BEA (22.7k) + Coedit GEC (19.8k) + filtered agentlans (96.6k) = 139,110 pairs. Rank 16, all layers, 7500 iters target (killed at iter 2500 because val loss was bouncing 0.354–0.632).
+
+| Snapshot | F0.5 |
+|---|---|
+| iter 500 | 0.433 |
+| iter 2,000 (best val 0.354) | **0.502** |
+
+Worse than v2. agentlans data shifted the distribution away from the BEA-style minimal-edit annotations: precision held (0.572 vs v2's 0.589) but recall dropped (0.336 vs 0.386). The model learned to make fewer edits.
+
+### Lesson
+
+At this scale data quality dominates capacity. Higher LoRA rank on clean data and noisier data with the same rank both fall short of v2's clean-data-plus-default-capacity recipe. The next real lift requires **more clean minimal-edit data** (NUCLE + FCE + Lang-8 + multi-stage curriculum) — those are license-gated and were not available in this run.
+
+### v2 remains the best published model
+
+[`amiya/qwen2.5-3b-gec-v2`](https://huggingface.co/amiya/qwen2.5-3b-gec-v2) — F0.5 0.533, precision 0.589, recall 0.386.

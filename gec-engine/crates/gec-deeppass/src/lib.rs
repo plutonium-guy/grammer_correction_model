@@ -201,24 +201,129 @@ fn token_spans(text: &str) -> Vec<(&str, usize)> {
 
 #[cfg(feature = "llama-runtime")]
 pub mod llama_runtime {
-    use super::{LlmSession, Result};
+    use std::num::NonZeroU32;
     use std::path::Path;
+    use std::sync::Mutex;
 
+    use anyhow::Context;
+    use encoding_rs::UTF_8;
+    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use llama_cpp_2::llama_batch::LlamaBatch;
+    use llama_cpp_2::model::params::LlamaModelParams;
+    use llama_cpp_2::model::{AddBos, LlamaModel};
+    use llama_cpp_2::sampling::LlamaSampler;
+    use llama_cpp_2::token::LlamaToken;
+
+    use super::{LlmSession, Result};
+
+    /// llama-cpp-2 backed LLM. Loads the model once at construction; each
+    /// `generate` call creates a fresh context and a greedy sampler so
+    /// outputs are deterministic and there is no shared mutable state to
+    /// worry about across requests.
+    ///
+    /// Memory: model weights are loaded mmap+gpu; per-request context
+    /// allocates `n_ctx` KV cache. Use a small `n_ctx` for short prompts.
     pub struct LlamaCppLlm {
-        _path: std::path::PathBuf,
+        backend: LlamaBackend,
+        model: LlamaModel,
+        n_ctx: u32,
+        // LlamaBackend wants exclusive use; the Mutex serialises generate()
+        // calls so we don't trample llama.cpp's global state.
+        lock: Mutex<()>,
     }
 
     impl LlamaCppLlm {
         pub fn from_file(path: &Path) -> Result<Self> {
+            Self::with_n_ctx(path, 2048)
+        }
+
+        pub fn with_n_ctx(path: &Path, n_ctx: u32) -> Result<Self> {
+            let backend = LlamaBackend::init().context("LlamaBackend::init")?;
+            let model_params = LlamaModelParams::default();
+            let model = LlamaModel::load_from_file(&backend, path, &model_params)
+                .with_context(|| format!("LlamaModel::load_from_file({})", path.display()))?;
             Ok(Self {
-                _path: path.to_path_buf(),
+                backend,
+                model,
+                n_ctx,
+                lock: Mutex::new(()),
             })
         }
     }
 
     impl LlmSession for LlamaCppLlm {
-        fn generate(&self, _prompt: &str, _max_tokens: usize) -> Result<String> {
-            anyhow::bail!("llama-runtime not wired yet — see gec-engine/FOLLOWUPS.md")
+        fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+            let _guard = self
+                .lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("llama session mutex poisoned"))?;
+
+            let n_ctx = NonZeroU32::new(self.n_ctx).context("n_ctx must be > 0")?;
+            let ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
+            let mut ctx = self
+                .model
+                .new_context(&self.backend, ctx_params)
+                .context("model.new_context")?;
+
+            // Tokenize the prompt. We let llama.cpp add a BOS if the model
+            // expects one, which Qwen2.5's GGUF metadata signals.
+            let prompt_tokens: Vec<LlamaToken> = self
+                .model
+                .str_to_token(prompt, AddBos::Always)
+                .context("tokenize prompt")?;
+
+            let max_batch = ctx.n_ctx() as usize;
+            anyhow::ensure!(
+                prompt_tokens.len() < max_batch,
+                "prompt of {} tokens exceeds context size {}",
+                prompt_tokens.len(),
+                max_batch
+            );
+
+            // Feed the prompt as one batch.
+            let mut batch = LlamaBatch::new(max_batch, 1);
+            let last_prompt_idx = (prompt_tokens.len() - 1) as i32;
+            for (i, tok) in prompt_tokens.iter().enumerate() {
+                let is_last = (i as i32) == last_prompt_idx;
+                batch
+                    .add(*tok, i as i32, &[0], is_last)
+                    .context("add prompt token to batch")?;
+            }
+            ctx.decode(&mut batch).context("ctx.decode prompt")?;
+
+            // Greedy sampler for determinism. Real deployments will swap in
+            // temperature / top-p; that lives behind a knob in DeepPass.
+            let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+
+            let mut out = String::new();
+            let mut cursor = prompt_tokens.len() as i32;
+            // Streaming UTF-8 decoder: rebuilds multi-byte glyphs that
+            // span successive tokens.
+            let mut decoder = UTF_8.new_decoder();
+            for _ in 0..max_tokens {
+                let next = sampler.sample(&ctx, -1);
+                sampler.accept(next);
+
+                if self.model.is_eog_token(next) {
+                    break;
+                }
+
+                let piece = self
+                    .model
+                    .token_to_piece(next, &mut decoder, true, None)
+                    .context("token_to_piece")?;
+                out.push_str(&piece);
+
+                batch.clear();
+                batch
+                    .add(next, cursor, &[0], true)
+                    .context("add generated token to batch")?;
+                ctx.decode(&mut batch).context("ctx.decode generated")?;
+                cursor += 1;
+            }
+
+            Ok(out)
         }
     }
 }

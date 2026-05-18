@@ -16,6 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 gec-core = { path = "../gec-core" }
+gec-fastpass = { path = "../gec-fastpass", features = ["ort-runtime"] }
+gec-deeppass = { path = "../gec-deeppass", features = ["llama-runtime"] }
+gec-tokenizer = { path = "../gec-tokenizer" }
+gec-aligner = { path = "../gec-aligner" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
